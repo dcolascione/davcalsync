@@ -1,0 +1,5 @@
+[FORMAT]
+indent-string="  "
+
+[MESSAGES CONTROL]
+disable=missing-docstring,unused-argument,invalid-name,redefined-builtin,consider-using-f-string,fixme,too-many-arguments,broad-exception-raised,too-few-public-methods,import-outside-toplevel,broad-exception-caught,use-dict-literal

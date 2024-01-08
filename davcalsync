@@ -1,0 +1,641 @@
+#!/usr/bin/env python3
+
+# Parts of this file taken from ews_calendar_sync
+
+import hashlib
+import logging
+import os
+import pickle
+import subprocess
+import sys
+
+from functools import cached_property
+import http.client
+
+from typing import (
+  Any,
+  Callable,
+  Dict,
+  Iterable,
+  List,
+  Optional,
+  Set,
+  Tuple,
+  Type,
+  TypeVar,
+  cast,
+)
+
+from abc import ABC, abstractmethod
+
+from argparse import (
+  ArgumentParser,
+  ArgumentDefaultsHelpFormatter,
+)
+
+from dataclasses import dataclass
+from datetime import datetime
+
+from os.path import (
+  basename,
+  dirname,
+  join as pjoin,
+  realpath,
+)
+
+import caldav
+import caldav.lib.error
+import exchangelib  # type: ignore
+import icalendar  # type: ignore
+import yaml
+
+from atomicfile import AtomicFile  # type: ignore
+from google.auth.transport.requests import Request  # type: ignore
+from google_auth_oauthlib.flow import InstalledAppFlow  # type: ignore
+from requests.auth import AuthBase
+
+from xdg_base_dirs import (
+  xdg_cache_home,
+  xdg_config_home,
+)
+
+PROGRAM_NAME: str = basename(__file__)
+CALDAV_EWS_PROPERTY = "X-DAVCAL-SYNC-SOURCE-ID"
+SYNC_STATE_FILE_NAME = "sync_state"
+CALDAV_UID_PREFIX = "dc4-"
+
+log: logging.Logger = logging.getLogger(PROGRAM_NAME)
+log_http: logging.Logger = log.getChild("www")
+
+T = TypeVar("T")
+
+EventPredicate = Callable[[caldav.CalendarObjectResource], bool]
+
+@dataclass
+class SyncResult:
+  sync_state: Optional[object]
+  nr_deleted: int
+  nr_updated: int
+
+@dataclass
+class Channel:
+  name: str
+  data_dir: str
+
+  def load_sync_state(self) -> Optional[object]:
+    try:
+      with open(pjoin(self.data_dir, SYNC_STATE_FILE_NAME), "rb") \
+           as sync_state_file:
+        return cast(object, pickle.load(sync_state_file))
+    except FileNotFoundError:
+      return None
+
+  def save_sync_state(self, sync_state: Optional[object]) -> None:
+    with AtomicFile(pjoin(self.data_dir, SYNC_STATE_FILE_NAME), "wb") \
+         as sync_state_file:
+      pickle.dump(sync_state, sync_state_file)
+
+def extract_first_event_data(data: icalendar.cal.Calendar) \
+    -> icalendar.Event:
+  event_data = next(
+    iter(c for c in data.subcomponents
+         if isinstance(c, icalendar.Event)), None)
+  if not event_data:
+    raise Exception(f"item {data!r} has no event data")
+  return event_data
+
+def extract_all_event_data(data: icalendar.cal.Calendar) \
+    -> icalendar.Event:
+  yield from (c for c in data.subcomponents
+              if isinstance(c, icalendar.Event))
+
+def icalendar_component(event: caldav.CalendarObjectResource) \
+    -> icalendar.Event:
+  return event.icalendar_component  # type: ignore
+
+class Sink(ABC):
+  def __init__(self, *, channel: Channel):
+    self._channel = channel
+
+  @abstractmethod
+  def delete_event(self, sync_id: str) -> int:
+    raise NotImplementedError
+
+  def delete_events(self, sync_ids: Iterable[str]) -> int:
+    nr_deleted = 0
+    for sync_id in sync_ids:
+      nr_deleted += self.delete_event(sync_id)
+    return nr_deleted
+
+  @abstractmethod
+  def delete_all_synced_events(self) -> int:
+    raise NotImplementedError
+
+  @abstractmethod
+  def add_or_update_event(
+      self,
+      sync_id: str,
+      data: icalendar.Calendar) -> None:
+    raise NotImplementedError
+
+  def send_one(self, ical_data: bytes) -> None:
+    raise NotImplementedError
+
+  def dump(self, *, sync_id: Optional[str] = None) -> None:
+    raise NotImplementedError
+
+class Source(ABC):
+  def __init__(self, *, channel: Channel):
+    self._channel = channel
+
+  @abstractmethod
+  def sync_to(self, sink: Sink, sync_state: Optional[Any]) -> SyncResult:
+    raise NotImplementedError
+
+class EwsSource(Source):
+  def __init__(self, *,
+               ews_server: str,
+               ews_username: str,
+               ews_password: str,
+               ews_email_address: str,
+               **kwargs: Any):
+    super().__init__(**kwargs)
+    self.__config = exchangelib.Configuration(
+      server=ews_server,
+      credentials=exchangelib.Credentials(
+        username=ews_username,
+        password=ews_password))
+    self.__ews_email_address = ews_email_address
+
+  @classmethod
+  def from_yaml(cls, config: Dict[str, Any], **kwargs: Any) -> "EwsSource":
+    reject_unknown_keys(config, [
+      "type",
+      "ews_server",
+      "ews_username",
+      "ews_password_program",
+      "ews_email_address",
+    ])
+    password = subprocess.run(
+      extract_key(config, "ews_password_program", str),
+      shell=True,
+      encoding="UTF-8",
+      stdout=subprocess.PIPE,
+      check=True).stdout
+    return EwsSource(
+      ews_server=extract_key(config, "ews_server", str),
+      ews_username=extract_key(config, "ews_username", str),
+      ews_password=password,
+      ews_email_address=extract_key(config, "ews_email_address", str),
+      **kwargs)
+
+  @cached_property
+  def __ews_account(self) -> exchangelib.Account:
+    return exchangelib.Account(
+      primary_smtp_address=self.__ews_email_address,
+      access_type=exchangelib.DELEGATE,
+      config=self.__config)
+
+  @property
+  def __ews_calendar(self) -> exchangelib.folders.Calendar:
+    return self.__ews_account.calendar
+
+  def __get_update_ids(self, sync_state: Optional[Any]) \
+      -> Tuple[List[Tuple[str,str]], List[str]]:
+    ews_fetch_ids = []
+    caldav_delete_ids = []
+    seen = set()
+    # pylint: disable=no-member
+    for change_type, item in self.__ews_calendar.sync_items(
+        sync_state=sync_state,
+        only_fields=["uid", "id", "changekey"]):
+      assert item.id not in seen, repr(item.id)
+      seen.add(item.id)
+      if change_type in ("create", "update"):
+        ews_fetch_ids.append((item.id, item.changekey))
+      if change_type == "delete":
+        caldav_delete_ids.append(item.id)
+    return ews_fetch_ids, caldav_delete_ids
+
+  def __update(self, sink: Sink, item: exchangelib.CalendarItem) -> None:
+    log.info("adding/updating %r to CalDAV server", item.subject)
+    if not item.mime_content:
+      raise Exception(f"item {item.subject!r} has no MIME content")
+    data = icalendar.Calendar.from_ical(item.mime_content.decode("UTF-8"))
+    del data["method"]
+    event_data = extract_first_event_data(data)
+    status = event_data["X-MICROSOFT-CDO-BUSYSTATUS"]
+    event_data["transp"] = \
+      "TRANSPARENT" if status == 'FREE' else "OPAQUE"
+    if status == "TENTATIVE":
+      event_data["status"] = "TENTATIVE"
+    sink.add_or_update_event(item.id, data)
+
+  def sync_to(self, sink: Sink, sync_state: Optional[Any]) -> SyncResult:
+    if not isinstance(sync_state, str):
+      log.warning("ignoring unrecognized sync state %r", sync_state)
+      sync_state = None
+    ews_fetch_ids, sync_delete_ids = \
+      self.__get_update_ids(sync_state)
+    nr_deleted = sink.delete_events(sync_delete_ids)
+    nr_updated = 0
+    log.info("ews_fetch_ids=%r", ews_fetch_ids)
+    for item in self.__ews_account.fetch(ids=ews_fetch_ids):
+      if isinstance(item, exchangelib.CalendarItem):
+        self.__update(sink, item)
+        nr_updated += 1
+    return SyncResult(
+      # pylint: disable=no-member
+      sync_state=self.__ews_calendar.item_sync_state,
+      nr_deleted=nr_deleted,
+      nr_updated=nr_updated,
+    )
+
+class GoogleCalendarSink(Sink):
+  def __init__(self,
+               google_calendar_id: str,
+               calendar_name: str,
+               **kwargs: Any):
+    super().__init__(**kwargs)
+    self.__google_calendar_id = google_calendar_id
+    self.__calendar_name = calendar_name
+    self.__seen_sync_ids: Set[str] = set()
+
+  @classmethod
+  def from_yaml(cls, config: Dict[str, Any], **kwargs: Any) \
+      -> "GoogleCalendarSink":
+    reject_unknown_keys(config, [
+      "type",
+      "google_calendar_id",
+      "calendar_name",
+    ])
+    return GoogleCalendarSink(
+      google_calendar_id=extract_key(config, "google_calendar_id", str),
+      calendar_name=extract_key(config, "calendar_name", str),
+      **kwargs)
+
+  @cached_property
+  def __caldav_calendar(self) -> caldav.Calendar:
+    url = ("https://apidata.googleusercontent.com/caldav/v2/"
+           f"{self.__google_calendar_id}/events")
+    client = caldav.DAVClient(url, auth=OAuth(self.__get_google_token()))
+    def _response_hook(response: Any, *args: Any, **kwargs: Any) -> None:
+      from requests_toolbelt.utils import dump  # type: ignore
+      for line in dump.dump_all(response).decode("UTF-8").split("\n"):
+        log_http.debug("%s", line.rstrip("\r"))
+
+    client.session.hooks["response"] = _response_hook  # type: ignore
+    c = client.principal().calendar(name=self.__calendar_name)
+    log.debug("got DAV calendar %r", c)
+    return c
+
+  def __get_google_token(self) -> Any:
+    google_token_file_name = pjoin(
+      self._channel.data_dir, "google.token.pickle")
+    token = None
+    try:
+      with open(google_token_file_name, "rb") as google_token_file:
+        token = pickle.load(google_token_file)
+    except FileNotFoundError:
+      pass
+    if token and not token.valid and token.expired and token.refresh_token:
+      log.debug("need to refresh token")
+      try:
+        token.refresh(Request())
+      except Exception:
+        log.warning(
+          "error refreshing token: getting new one", exc_info=True)
+        token = None
+    scopes = ['https://www.googleapis.com/auth/calendar']
+    # N.B. for installed desktop apps, Google doesn't treat
+    # client_secret as a secret.
+    if not token or not token.valid:
+      token = (InstalledAppFlow
+               .from_client_secrets_file(
+                 pjoin(dirname(realpath(__file__)),
+                       "client_secret.json"), scopes)
+               .run_local_server(port=0, access_type="offline"))
+    with AtomicFile(google_token_file_name, "wb") as google_token_file:
+      pickle.dump(token, google_token_file)
+    return token
+
+  def __search(
+      self,
+      event_filter: caldav.elements.cdav.CalendarQuery,
+      predicate: EventPredicate) -> Iterable[caldav.CalendarObjectResource]:
+    # N.B. we need a predicate so we can do client-side filtering We
+    # need client-side filtering because some servers (e.g. Google
+    # Calendar) match in REPORT events that don't satisfy the
+    # passed-in filter: we have to assume the server treats the filter
+    # we send it as a non-binding hint.
+    for item in self.__caldav_calendar.search(event_filter):  # type:ignore
+      data = icalendar.Calendar.from_ical(item.data)
+      if next(extract_all_event_data(data), None) is None:
+        log.debug("non-VEVENT item: skipping")
+        continue
+      if not predicate(item):
+        log.debug("predicate failed on item: skipping")
+        continue
+      yield item
+
+  def __delete_matching_events(
+      self,
+      event_filter: caldav.elements.cdav.CalendarQuery,
+      predicate: EventPredicate) -> int:
+    nr = 0
+    log.debug("matching filter %s for deletion", event_filter)
+    events = list(self.__search(event_filter, predicate))
+    log.debug("#events = %r", len(events))
+    for dav_object in events:
+      log.debug("deleting event %r %r", dav_object, dav_object.data)
+      dav_object.delete()
+      nr += 1
+    return nr
+
+  def __make_caldav_id(self, inp: str) -> str:
+    # Shorten IDs to make them fit in Google's length limits
+    return CALDAV_UID_PREFIX + \
+      hashlib.sha256(inp.encode("UTF-8")).hexdigest()
+
+  def __create_filter_sync_id(self, sync_id: str) \
+      -> caldav.elements.cdav.CalendarQuery:
+    from caldav.elements import cdav, dav
+    data = cdav.CalendarData()
+    prop = dav.Prop() + data
+    query = cdav.TextMatch(sync_id)
+    query2 = cdav.PropFilter(CALDAV_EWS_PROPERTY) + query
+    query3 = cdav.CompFilter("VEVENT") + query2
+    vcalendar = cdav.CompFilter("VCALENDAR") + query3
+    the_filter = cdav.Filter() + vcalendar
+    return cdav.CalendarQuery() + [prop, the_filter]  # type: ignore
+
+  def __create_predicate_sync_id(self, sync_id: str) -> EventPredicate:
+    def _predicate(event: caldav.CalendarObjectResource) -> bool:
+      event_sync_id : Optional[str] = \
+        icalendar_component(event).get(CALDAV_EWS_PROPERTY, None)
+      log.debug("sync_id=%r found=%r", sync_id, event_sync_id)
+      return sync_id == event_sync_id
+    return _predicate
+
+  def __create_filter_any_sync_id(self) \
+      -> caldav.elements.cdav.CalendarQuery:
+    from caldav.elements import cdav, dav
+    prop = dav.Prop() + cdav.CalendarData()  # What to fetch
+    # Filter the returned items to those with a sync ID
+    the_filter = \
+      (cdav.Filter()
+       + (cdav.CompFilter("VCALENDAR")
+          + (cdav.CompFilter("VEVENT")
+             + cdav.PropFilter(CALDAV_EWS_PROPERTY))))
+    result = cdav.CalendarQuery() + [prop, the_filter]  # type: ignore
+    log.debug("synced events filter=%s", result)
+    return result
+
+  def __create_predicate_any_sync_id(self) -> EventPredicate:
+    def _predicate(event: caldav.CalendarObjectResource) -> bool:
+      return CALDAV_EWS_PROPERTY in icalendar_component(event)
+    return _predicate
+
+  def delete_event(self, sync_id: str) -> int:
+    log.debug("deleting event with sync_id=%r", sync_id)
+    return self.__delete_matching_events(
+      self.__create_filter_sync_id(sync_id),
+      self.__create_predicate_sync_id(sync_id))
+
+  def delete_all_synced_events(self) -> int:
+    return self.__delete_matching_events(
+      self.__create_filter_any_sync_id(),
+      self.__create_predicate_any_sync_id())
+
+  def add_or_update_event(self,
+                          sync_id: str,
+                          data: icalendar.Calendar) -> None:
+    event_data = extract_first_event_data(data)
+    # Remember that we synchronized this entry
+    assert sync_id not in self.__seen_sync_ids
+    self.__seen_sync_ids.add(sync_id)
+    event_data[CALDAV_EWS_PROPERTY] = sync_id
+    new_id = None
+    for a_event_data in extract_all_event_data(data):
+      # Need to remove organizer so that Google Calendar doesn't reject
+      # modifications to events we ourselves added.
+      a_event_data.pop("ORGANIZER", None)
+      # Sanitize the UID to avoid Google length limits
+      a_event_data["UID"] = new_id = \
+        self.__make_caldav_id(a_event_data["UID"])
+    ical_data = data.to_ical()
+    assert new_id is not None
+    log.debug("ical_data=%r", ical_data)
+    try:
+      try:
+        self.__caldav_calendar.save_event(ical_data, id=new_id)
+      except caldav.lib.error.PutError as ex:
+        if "409 Conflict" not in str(ex):  # Hack
+          raise
+        # Google CalDAV sometimes rejects with 409 Conflict errors
+        # attempts to update items with exceptions to a recurring
+        # events.  Hack: try to delete the event, then re-"create" it
+        log.debug("got 409 Conflict problem: trying to delete and re-save")
+        self.delete_event(sync_id)
+        self.__caldav_calendar.save_event(ical_data, id=new_id)
+    except caldav.lib.error.DAVError:
+      log.error("error saving event?!?! %r", ical_data, exc_info=True)
+      with open(pjoin(
+          self._channel.data_dir, "dead-letter"), "a", encoding="UTF-8") \
+           as dead_letter:
+        dead_letter.write(repr(ical_data))
+        dead_letter.write("\n")
+      raise
+
+  def send_one(self, ical_data: bytes) -> None:
+    self.__caldav_calendar.save_event(ical_data)  # type: ignore
+
+  def dump(self, *, sync_id: Optional[str] = None) -> None:
+    if sync_id is None:
+      events = self.__search(
+        self.__create_filter_any_sync_id(),
+        self.__create_predicate_any_sync_id())
+    else:
+      events = self.__search(
+        self.__create_filter_sync_id(sync_id),
+        self.__create_predicate_sync_id(sync_id))
+    for event in events:
+      for event_data in extract_all_event_data(event.icalendar_instance):
+        print(event_data.get(CALDAV_EWS_PROPERTY, None))
+
+SOURCES = {
+  "EWS": EwsSource,
+}
+
+SINKS = {
+  "Google": GoogleCalendarSink,
+}
+
+class OAuth(AuthBase):
+  def __init__(self, credentials: Any):
+    self.credentials = credentials
+
+  def __call__(self, r):  # type: ignore
+    self.credentials.apply(r.headers)
+    return r
+
+def load_channel(channel_name: str,
+                 channel_config: Dict[str, Any]) \
+    -> Tuple[Channel, Source, Sink]:
+  reject_unknown_keys(channel_config, ["source", "sink"])
+  channel = Channel(
+    name=channel_name,
+    data_dir=pjoin(xdg_cache_home(), PROGRAM_NAME, channel_name))
+  os.makedirs(channel.data_dir, exist_ok=True)
+  return (
+    channel,
+    (SOURCES[channel_config["source"]["type"]]
+     .from_yaml(channel_config["source"], channel=channel)),
+    (SINKS[channel_config["sink"]["type"]]
+     .from_yaml(channel_config["sink"], channel=channel)))
+
+def load_channels() -> List[Tuple[Channel, Source, Sink]]:
+  config_dir = pjoin(xdg_config_home(), PROGRAM_NAME)
+  os.makedirs(config_dir, exist_ok=True)
+  config_file_name = pjoin(config_dir, PROGRAM_NAME + ".yaml")
+  with open(config_file_name, "r", encoding="UTF-8") as config_file:
+    config = yaml.safe_load(config_file)
+  return [
+    load_channel(channel_name, channel_config)
+    for channel_name, channel_config in config["channels"].items()]
+
+def reject_unknown_keys(config: Dict[str, Any],
+                        allowed_keys: Iterable[str]) -> None:
+  unknown_keys = set(config) - set(allowed_keys)
+  if unknown_keys:
+    raise ValueError(
+      f"unknown keys is config: {sorted(unknown_keys)!r}")
+
+def extract_key(config: Dict[str, Any],
+                key:str,
+                wanted_type: Type[T]) -> T:
+  value = config[key]
+  if not isinstance(value, wanted_type):
+    raise ValueError(
+      f"config key of wrong type: found {value!r} wanted {wanted_type}")
+  return value
+
+def sync_one_channel(channel: Channel, source: Source, sink: Sink) \
+    -> None:
+  start_time = datetime.now()
+  log.info("syncing channel %r", channel.name)
+  log.debug("data_dir=%r", channel.data_dir)
+  sync_state = channel.load_sync_state()
+  if sync_state is None:
+    log.info("no previous sync state: starting over")
+    nr = sink.delete_all_synced_events()
+    log.info("deleted %d previously synced events", nr)
+  else:
+    log.info("reusing previous sync state")
+  result = source.sync_to(sink, sync_state)
+  log.debug("output sync_state=%r", result.sync_state)
+  log.info("synced channel %r nr_updated=%d nr_deleted=%d elapsed=%s",
+           channel.name, result.nr_updated, result.nr_deleted,
+           datetime.now() - start_time)
+  channel.save_sync_state(result.sync_state)
+
+def main_sync(args: Any) -> None:
+  for channel, source, sink in load_channels():
+    sync_one_channel(channel, source, sink)
+
+def main_send_one(args: Any) -> None:
+  with open(args.ical_file, "rb") as ical_file:
+    ical_data = ical_file.read()
+  for channel, _source, sink in load_channels():
+    if channel.name == args.channel:
+      sink.send_one(ical_data)
+      return
+  raise KeyError(f"no channel called {args.channel!r}")
+
+def main_clear_all(args: Any) -> None:
+  for channel, _source, sink in load_channels():
+    if channel.name == args.channel:
+      sink.delete_all_synced_events()
+      return
+  raise KeyError(f"no channel called {args.channel!r}")
+
+def main_dump(args: Any) -> None:
+  for channel, _source, sink in load_channels():
+    if channel.name == args.channel:
+      sink.dump(sync_id=args.sync_id)
+      return
+  raise KeyError(f"no channel called {args.channel!r}")
+
+def debug_requests_on() -> None:
+  from http.client import HTTPConnection
+  HTTPConnection.debuglevel = 1
+  def hack_log(*args: Any) -> None:
+    log_http.log(logging.DEBUG, " ".join(args))
+  setattr(http.client, "print", hack_log)
+
+  requests_log = logging.getLogger("requests.packages.urllib3")
+  requests_log.setLevel(logging.DEBUG)
+  requests_log.propagate = True
+
+def main(argv: List[str]) -> Optional[int]:
+  debug_requests_on()
+  ap_kwargs = dict(
+    formatter_class=ArgumentDefaultsHelpFormatter,
+    allow_abbrev=False)
+  # Tell Requests to use the system's root CA store instead of some
+  # custom bundled thing.
+  os.environ["REQUESTS_CA_BUNDLE"] = \
+    "/etc/ssl/certs/ca-certificates.crt"
+
+  p = ArgumentParser(description="sync calendars",
+                     **ap_kwargs)  # type: ignore
+  p.add_argument("--debug",
+                 help="Enable verbose logging",
+                 action="store_true")
+  subp = p.add_subparsers()
+  subp.required = True
+
+  p_sync = subp.add_parser(
+    "sync", help="synchronize calendars", **ap_kwargs)  # type: ignore
+  p_sync.set_defaults(cmdfn=main_sync)
+
+  p_send_one = subp.add_parser(
+    "send-one", help="send one ical entry for debugging",
+    **ap_kwargs)  # type: ignore
+  p_send_one.add_argument("channel",
+                          metavar="CHANNEL",
+                          help="channel to which to send")
+  p_send_one.add_argument("ical_file",
+                          metavar="ICAL_FILE",
+                          help="icalendar file to send")
+  p_send_one.set_defaults(cmdfn=main_send_one)
+
+  p_send_one = subp.add_parser(
+    "clear-all", help="clear all synced events",
+    **ap_kwargs)  # type: ignore
+  p_send_one.add_argument("channel",
+                          metavar="CHANNEL",
+                          help="channel to clear")
+  p_send_one.set_defaults(cmdfn=main_clear_all)
+
+  p_dump = subp.add_parser(
+    "dump", help="dump all synced events",
+    **ap_kwargs)  # type: ignore
+  p_dump.add_argument("channel",
+                      metavar="CHANNEL",
+                      help="channel to dump")
+  p_dump.add_argument("--sync-id", help="sync ID for which to search")
+  p_dump.set_defaults(cmdfn=main_dump)
+
+  args = p.parse_args(argv)
+  logging.basicConfig(
+    format=("%(name)s: %(levelname)s: %(message)s"
+            if args.debug else
+            "%(name)s: %(message)s"),
+    level=logging.DEBUG if args.debug else logging.INFO)
+  result = args.cmdfn(args)
+  assert result is None or isinstance(result, int)
+  return result
+
+if __name__ == "__main__":
+  sys.exit(main(sys.argv[1:]))
